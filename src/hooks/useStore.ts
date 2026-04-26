@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { ChildId, PointRecord, ExchangeRecord, AppState, Child, Task, Reward } from '../types'
 import {
-  supabase,
   isConfigured,
+  checkCloudAvailable,
   fetchChildren,
   fetchRecords,
   fetchExchanges,
@@ -10,14 +10,21 @@ import {
   addExchangeRecord as cloudAddExchange,
   deleteRecordById,
   subscribeRecords,
-  subscribeExchanges
+  subscribeExchanges,
+  saveCache,
+  loadCache
 } from '../lib/supabase'
 
 // ============================================================
 // 本地存储
 // ============================================================
 const STORAGE_KEY = 'point-system-data'
-const CLOUD_MIGRATED_KEY = 'point-system-migrated-to-cloud'
+
+// 本地默认孩子数据
+const localChildren: Child[] = [
+  { id: '00000000-0000-0000-0000-000000000001', name: '馒头', avatar: 'mantou' },
+  { id: '00000000-0000-0000-0000-000000000002', name: '饺子', avatar: 'jiaozi' }
+]
 
 const defaultState: AppState = {
   currentChild: '00000000-0000-0000-0000-000000000001',
@@ -32,7 +39,6 @@ function loadState(): AppState {
     const saved = localStorage.getItem(STORAGE_KEY)
     if (saved) {
       const parsed = JSON.parse(saved)
-      // 兼容旧数据，补充缺失字段
       return {
         ...defaultState,
         ...parsed,
@@ -51,7 +57,7 @@ function saveState(state: AppState) {
 }
 
 // ============================================================
-// Supabase 返回的数据适配（cloud → local 格式）
+// Supabase 返回的数据适配
 // ============================================================
 function adaptRecord(r: any): PointRecord {
   return {
@@ -71,7 +77,7 @@ function adaptExchange(e: any): ExchangeRecord {
   return {
     id: e.id,
     childId: e.child_id,
-    rewardId: '',
+    rewardId: e.reward_id || '',
     rewardName: e.reward_name,
     points: e.reward_points,
     date: e.date,
@@ -84,21 +90,19 @@ function adaptExchange(e: any): ExchangeRecord {
 // ============================================================
 export function useStore() {
   const [state, setState] = useState<AppState>(loadState)
-  const [children, setChildren] = useState<Child[]>([])
-  const [loading, setLoading] = useState(false)
+  const [children, setChildren] = useState<Child[]>(localChildren)
+  const [loading, setLoading] = useState(true)
   const [cloudMode, setCloudMode] = useState(false)
   const loadedRef = useRef(false)
 
-  // state 每次变化自动持久化到 localStorage（云端模式不覆盖）
+  // state 每次变化自动持久化到 localStorage
   useEffect(() => {
     if (!cloudMode) {
       saveState(state)
     }
   }, [state, cloudMode])
 
-  // ============================================================
-  // 初始化：判断用本地还是云端
-  // ============================================================
+  // 初始化
   useEffect(() => {
     if (loadedRef.current) return
     loadedRef.current = true
@@ -106,52 +110,96 @@ export function useStore() {
   }, [])
 
   async function init() {
-    if (isConfigured) {
-      await loadFromCloud()
-    }
-  }
-
-  async function loadFromCloud() {
     setLoading(true)
     try {
-      // 标记已迁移（从今天开始全新数据）
-      localStorage.setItem(CLOUD_MIGRATED_KEY, 'true')
-      localStorage.removeItem(STORAGE_KEY)
-
-      // 加载孩子列表
-      const childList = await fetchChildren()
-      setChildren(childList)
-
-      // 加载所有孩子的记录（从今天开始，无历史数据）
-      const allRecords: PointRecord[] = []
-      const allExchanges: ExchangeRecord[] = []
-      for (const child of childList) {
-        const recs = await fetchRecords(child.id)
-        allRecords.push(...recs.map(adaptRecord))
-        const exs = await fetchExchanges(child.id)
-        allExchanges.push(...exs.map(adaptExchange))
+      // 先尝试检测云端
+      const cloudAvailable = await checkCloudAvailable()
+      
+      if (cloudAvailable && isConfigured) {
+        console.log('云端可用，加载云端数据...')
+        try {
+          await loadFromCloud()
+        } catch (err) {
+          console.error('云端加载失败:', err)
+          // 尝试读取缓存
+          const cache = loadCache()
+          if (cache && cache.records.length > 0) {
+            console.log('使用缓存数据')
+            applyCacheData(cache)
+          } else {
+            console.log('无缓存，使用本地模式')
+            setChildren(localChildren)
+            setCloudMode(false)
+          }
+        }
+      } else {
+        console.log('云端不可用，尝试读取缓存')
+        const cache = loadCache()
+        if (cache && cache.records.length > 0) {
+          console.log('使用缓存数据')
+          applyCacheData(cache)
+        } else {
+          console.log('无缓存，使用本地模式')
+          setChildren(localChildren)
+          setCloudMode(false)
+        }
       }
-
-      const cloudState: AppState = {
-        currentChild: childList[0]?.id || '00000000-0000-0000-0000-000000000001',
-        records: allRecords,
-        exchanges: allExchanges,
-        customTasks: [],
-        customRewards: []
-      }
-      setState(cloudState)
-      setCloudMode(true)
     } catch (err) {
-      console.error('云端加载失败，回退到本地模式:', err)
+      console.error('初始化失败:', err)
+      setChildren(localChildren)
       setCloudMode(false)
     } finally {
       setLoading(false)
     }
   }
 
-  // ============================================================
-  // 实时同步订阅（切换孩子时重新订阅）
-  // ============================================================
+  function applyCacheData(cache: { children: Child[], records: any[], exchanges: any[] }) {
+    setChildren(cache.children.length > 0 ? cache.children : localChildren)
+    const cacheState: AppState = {
+      currentChild: cache.children[0]?.id || '00000000-0000-0000-0000-000000000001',
+      records: cache.records.map(adaptRecord),
+      exchanges: cache.exchanges.map(adaptExchange),
+      customTasks: [],
+      customRewards: []
+    }
+    setState(cacheState)
+    setCloudMode(false)
+  }
+
+  async function loadFromCloud() {
+    const childList = await fetchChildren()
+    setChildren(childList.length > 0 ? childList : localChildren)
+
+    const allRecords: any[] = []
+    const allExchanges: any[] = []
+    
+    for (const child of childList) {
+      const recs = await fetchRecords(child.id)
+      allRecords.push(...recs)
+      const exs = await fetchExchanges(child.id)
+      allExchanges.push(...exs)
+    }
+
+    // 保存到缓存
+    saveCache({
+      children: childList,
+      records: allRecords,
+      exchanges: allExchanges
+    })
+
+    const cloudState: AppState = {
+      currentChild: childList[0]?.id || '00000000-0000-0000-0000-000000000001',
+      records: allRecords.map(adaptRecord),
+      exchanges: allExchanges.map(adaptExchange),
+      customTasks: [],
+      customRewards: []
+    }
+    setState(cloudState)
+    setCloudMode(true)
+    console.log('云端数据加载成功，共', allRecords.length, '条记录')
+  }
+
+  // 实时同步订阅
   const recordSubRef = useRef<ReturnType<typeof subscribeRecords>>(null)
   const exchangeSubRef = useRef<ReturnType<typeof subscribeExchanges>>(null)
 
@@ -160,11 +208,9 @@ export function useStore() {
 
     const childId = state.currentChild
 
-    // 取消旧订阅
     recordSubRef.current?.unsubscribe()
     exchangeSubRef.current?.unsubscribe()
 
-    // 重新订阅
     recordSubRef.current = subscribeRecords(childId, async () => {
       const recs = await fetchRecords(childId)
       setState(prev => ({
@@ -187,10 +233,7 @@ export function useStore() {
     }
   }, [cloudMode, state.currentChild])
 
-  // ============================================================
   // 数据变更方法
-  // ============================================================
-
   const setCurrentChild = useCallback((childId: ChildId) => {
     setState(prev => ({ ...prev, currentChild: childId }))
   }, [])
@@ -199,8 +242,10 @@ export function useStore() {
     const now = new Date()
     const date = record.date || now.toISOString().split('T')[0]
     const time = now.toTimeString().slice(0, 5)
+    const tempId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
 
     const newRecord: PointRecord = {
+      id: tempId,
       ...record,
       date,
       time,
@@ -208,18 +253,22 @@ export function useStore() {
     }
 
     if (cloudMode) {
-      await cloudAddRecord({
-        child_id: newRecord.childId,
-        task_id: newRecord.taskId,
-        task_name: newRecord.taskName,
-        task_category: (newRecord as any).taskCategory || '',
-        points: newRecord.points,
-        date: newRecord.date
-      })
-    } else {
-      newRecord.id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-      setState(prev => ({ ...prev, records: [newRecord, ...prev.records] }))
+      try {
+        const saved = await cloudAddRecord({
+          child_id: newRecord.childId,
+          task_id: newRecord.taskId,
+          task_name: newRecord.taskName,
+          task_category: (newRecord as any).taskCategory || '',
+          points: newRecord.points,
+          date: newRecord.date
+        })
+        newRecord.id = saved.id
+      } catch (err) {
+        console.error('云端保存失败，保存到本地:', err)
+      }
     }
+    
+    setState(prev => ({ ...prev, records: [newRecord, ...prev.records] }))
     return newRecord
   }, [cloudMode])
 
@@ -227,30 +276,40 @@ export function useStore() {
     const now = new Date()
     const date = now.toISOString().split('T')[0]
     const time = now.toTimeString().slice(0, 5)
+    const tempId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
 
     const newExchange: ExchangeRecord = {
+      id: tempId,
       ...exchange,
       date,
       time
     }
 
     if (cloudMode) {
-      await cloudAddExchange({
-        child_id: newExchange.childId,
-        reward_name: newExchange.rewardName,
-        reward_points: newExchange.points,
-        date: newExchange.date
-      })
-    } else {
-      newExchange.id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-      setState(prev => ({ ...prev, exchanges: [newExchange, ...prev.exchanges] }))
+      try {
+        const saved = await cloudAddExchange({
+          child_id: newExchange.childId,
+          reward_name: newExchange.rewardName,
+          reward_points: newExchange.points,
+          date: newExchange.date
+        })
+        newExchange.id = saved.id
+      } catch (err) {
+        console.error('云端保存失败，保存到本地:', err)
+      }
     }
+    
+    setState(prev => ({ ...prev, exchanges: [newExchange, ...prev.exchanges] }))
     return newExchange
   }, [cloudMode])
 
   const deleteRecord = useCallback(async (recordId: string) => {
     if (cloudMode) {
-      await deleteRecordById(recordId)
+      try {
+        await deleteRecordById(recordId)
+      } catch (err) {
+        console.error('云端删除失败:', err)
+      }
     }
     setState(prev => ({
       ...prev,

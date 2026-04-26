@@ -47,7 +47,7 @@ export function AddCustomRewardModal({ open, editReward, onClose, onSave, onDele
     if (editReward) {
       setName(editReward.name)
       setType(editReward.type)
-      setIsRatio(editReward.isRatio)
+      setIsRatio(editReward.isRatio ?? false)
       setPoints(editReward.isRatio ? '10' : String(editReward.points || ''))
       setRatioPoints(String(editReward.points || 10))
       setNote(editReward.note || '')

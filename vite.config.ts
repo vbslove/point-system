@@ -3,8 +3,9 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  base: '/point-system/',
   server: {
     port: 3000,
-    host: '0.0.0.0',  // 允许局域网访问
+    host: '0.0.0.0',
   }
 })

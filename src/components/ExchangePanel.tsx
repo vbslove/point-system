@@ -15,7 +15,7 @@ interface Props {
 }
 
 export function ExchangePanel({
-  childId,
+  childId: _childId,
   currentPoints,
   customRewards,
   onExchange,

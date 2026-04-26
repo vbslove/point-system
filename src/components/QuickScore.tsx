@@ -20,7 +20,7 @@ export function QuickScore({
   onAddCustomTask,
   onUpdateCustomTask,
   onDeleteCustomTask,
-  currentChild
+  currentChild: _currentChild
 }: QuickScoreProps) {
   const [selectedTask, setSelectedTask] = useState<Task | null>(null)
   const [selectedDates, setSelectedDates] = useState<string[]>([])
